@@ -1,0 +1,198 @@
+"""
+Module 2: Personalized Artificial Baseline (Kişiselleştirilmiş Yapay Baseline)
+
+Generates and tracks an individual's cognitive-motor baseline over time.
+Features tracked: speech rate, lexical diversity, motor response time, word recall.
+Anomaly detection flags deviations from personal norms — not population norms.
+
+Academic reference angle:
+  "Personalized AI Baseline for Early-Stage Dementia Detection in Down Syndrome"
+"""
+
+import numpy as np
+import pandas as pd
+import os
+import json
+import joblib
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import IsolationForest
+
+
+FEATURE_NAMES = ["speech_rate", "lexical_diversity", "motor_response_ms", "word_recall_score"]
+
+
+def simulate_patient_sessions(
+    patient_id: str,
+    n_normal: int = 60,
+    n_decline: int = 20,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Simulates daily session data for one patient.
+    First n_normal sessions are within normal range; next n_decline show gradual cognitive decline.
+    """
+    np.random.seed(seed)
+    baseline = {
+        "speech_rate": np.random.normal(110, 8),          # words/minute
+        "lexical_diversity": np.random.normal(0.72, 0.04), # type-token ratio (0-1)
+        "motor_response_ms": np.random.normal(420, 30),    # milliseconds
+        "word_recall_score": np.random.normal(7.5, 0.8),   # out of 10
+    }
+
+    records = []
+    start_date = datetime(2025, 1, 1)
+
+    for i in range(n_normal + n_decline):
+        date = start_date + timedelta(days=i)
+        if i < n_normal:
+            noise = {k: np.random.normal(0, baseline[k] * 0.05) for k in FEATURE_NAMES}
+            drift = {k: 0.0 for k in FEATURE_NAMES}
+        else:
+            step = i - n_normal + 1
+            noise = {k: np.random.normal(0, baseline[k] * 0.05) for k in FEATURE_NAMES}
+            drift = {
+                "speech_rate": -step * 1.2,
+                "lexical_diversity": -step * 0.008,
+                "motor_response_ms": step * 8.0,
+                "word_recall_score": -step * 0.15,
+            }
+
+        row = {
+            "patient_id": patient_id,
+            "date": date.strftime("%Y-%m-%d"),
+            "session_index": i,
+            "phase": "normal" if i < n_normal else "decline",
+        }
+        for feat in FEATURE_NAMES:
+            row[feat] = round(baseline[feat] + noise[feat] + drift[feat], 4)
+
+        records.append(row)
+
+    return pd.DataFrame(records)
+
+
+class PersonalizedBaselineModel:
+    """
+    Trains an IsolationForest on an individual's early (normal) sessions.
+    Subsequent sessions are scored against their own baseline — not a population norm.
+    """
+
+    def __init__(self, patient_id: str, model_dir: str = "models/baseline"):
+        self.patient_id = patient_id
+        self.model_dir = model_dir
+        self.scaler = StandardScaler()
+        self.detector = IsolationForest(contamination=0.05, random_state=42)
+        self._trained = False
+
+    def _paths(self):
+        os.makedirs(self.model_dir, exist_ok=True)
+        prefix = os.path.join(self.model_dir, f"{self.patient_id}")
+        return prefix + "_scaler.pkl", prefix + "_detector.pkl"
+
+    def train(self, sessions_df: pd.DataFrame, warm_up_sessions: int = 45):
+        """Fit on the first warm_up_sessions rows (assumed stable baseline)."""
+        train_data = sessions_df.head(warm_up_sessions)[FEATURE_NAMES].values
+        scaled = self.scaler.fit_transform(train_data)
+        self.detector.fit(scaled)
+        self._trained = True
+        sp, dp = self._paths()
+        joblib.dump(self.scaler, sp)
+        joblib.dump(self.detector, dp)
+        print(f"[Baseline] Model trained on {warm_up_sessions} sessions for patient '{self.patient_id}'.")
+
+    def load(self):
+        sp, dp = self._paths()
+        if not os.path.exists(sp):
+            raise FileNotFoundError("Baseline model not found. Run .train() first.")
+        self.scaler = joblib.load(sp)
+        self.detector = joblib.load(dp)
+        self._trained = True
+
+    def score_sessions(self, sessions_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Returns sessions_df with two extra columns:
+          anomaly_score  — IsolationForest raw score (lower = more anomalous)
+          is_anomaly     — bool flag
+        """
+        if not self._trained:
+            self.load()
+        X = sessions_df[FEATURE_NAMES].values
+        scaled = self.scaler.transform(X)
+        scores = self.detector.score_samples(scaled)        # negative = anomalous
+        flags = self.detector.predict(scaled) == -1         # True = anomaly
+
+        result = sessions_df.copy()
+        result["anomaly_score"] = np.round(scores, 4)
+        result["is_anomaly"] = flags
+        return result
+
+    def plot_baseline_drift(self, scored_df: pd.DataFrame, save_path: str = None):
+        """4-panel plot showing each feature over time with anomaly markers."""
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+        axes = axes.flatten()
+        colors = {"normal": "#4CAF50", "decline": "#F44336"}
+
+        for ax, feat in zip(axes, FEATURE_NAMES):
+            for phase, group in scored_df.groupby("phase"):
+                ax.plot(group["session_index"], group[feat],
+                        color=colors[phase], linewidth=1.5, label=phase)
+            anomalies = scored_df[scored_df["is_anomaly"]]
+            ax.scatter(anomalies["session_index"], anomalies[feat],
+                       color="black", marker="x", s=60, zorder=5, label="Anomaly")
+            ax.set_title(feat.replace("_", " ").title())
+            ax.set_xlabel("Session")
+            ax.legend(fontsize=8)
+            ax.grid(alpha=0.3)
+
+        fig.suptitle(f"Personalized Baseline Drift — Patient: {self.patient_id}", fontsize=14)
+        plt.tight_layout()
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=150)
+            print(f"[Baseline] Plot saved: {save_path}")
+        plt.show()
+
+    def generate_report(self, scored_df: pd.DataFrame) -> dict:
+        """Summary statistics for a clinical report."""
+        total = len(scored_df)
+        n_anomaly = scored_df["is_anomaly"].sum()
+        recent = scored_df.tail(14)  # last 2 weeks
+        recent_anomaly = recent["is_anomaly"].sum()
+
+        feature_trends = {}
+        for feat in FEATURE_NAMES:
+            first_q = scored_df.head(20)[feat].mean()
+            last_q = scored_df.tail(20)[feat].mean()
+            pct_change = (last_q - first_q) / (first_q + 1e-9) * 100
+            feature_trends[feat] = round(pct_change, 2)
+
+        return {
+            "patient_id": self.patient_id,
+            "total_sessions": total,
+            "total_anomalies": int(n_anomaly),
+            "anomaly_rate_pct": round(n_anomaly / total * 100, 1),
+            "recent_14d_anomalies": int(recent_anomaly),
+            "feature_trends_pct": feature_trends,
+            "alert": recent_anomaly >= 5,
+        }
+
+
+if __name__ == "__main__":
+    pid = "DS_001"
+    sessions = simulate_patient_sessions(pid, n_normal=60, n_decline=20)
+    sessions.to_csv(f"data/baseline_{pid}.csv", index=False)
+    print(f"Simulated {len(sessions)} sessions.")
+
+    model = PersonalizedBaselineModel(pid)
+    model.train(sessions, warm_up_sessions=45)
+
+    scored = model.score_sessions(sessions)
+    print(scored[["session_index", "phase", "anomaly_score", "is_anomaly"]].tail(30).to_string())
+
+    report = model.generate_report(scored)
+    print("\n=== Clinical Report ===")
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    model.plot_baseline_drift(scored, save_path="outputs/baseline_drift.png")

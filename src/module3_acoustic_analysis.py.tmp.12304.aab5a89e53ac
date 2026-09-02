@@ -1,0 +1,273 @@
+"""
+Module 3: Advanced Speech & Acoustic Analysis (Konuşma ve Akustik Analiz)
+
+Analyzes speech recordings for early dementia markers in Down syndrome individuals:
+  - Hesitation ratio     : pauses / total speech duration
+  - Lexical diversity    : type-token ratio of spoken words
+  - Speech rate          : words per minute
+  - F0 variability       : pitch instability (stress, fatigue)
+  - Energy variability   : loudness fluctuation
+
+Works in two modes:
+  1. REAL audio   — pass an actual .wav file path; requires librosa
+  2. SYNTHETIC    — simulate features from parameters (no audio required)
+
+Academic reference angle:
+  "Non-Invasive Passive Speech Biomarkers for Alzheimer Screening in Down Syndrome"
+"""
+
+import numpy as np
+import pandas as pd
+import os
+import json
+import matplotlib.pyplot as plt
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+
+@dataclass
+class AcousticFeatures:
+    hesitation_ratio: float       # 0-1
+    lexical_diversity: float      # type-token ratio 0-1
+    speech_rate_wpm: float        # words per minute
+    f0_variability_hz: float      # Hz standard deviation of pitch
+    energy_variability_db: float  # dB standard deviation of loudness
+    total_duration_s: float       # recording length in seconds
+    silence_count: int            # number of silent segments > 500ms
+
+    def to_vector(self) -> np.ndarray:
+        return np.array([
+            self.hesitation_ratio,
+            self.lexical_diversity,
+            self.speech_rate_wpm,
+            self.f0_variability_hz,
+            self.energy_variability_db,
+        ])
+
+
+def extract_from_audio(audio_path: str) -> AcousticFeatures:
+    """
+    Extracts acoustic features from a real .wav file using librosa.
+    Raises ImportError if librosa is not installed.
+    """
+    try:
+        import librosa
+    except ImportError:
+        raise ImportError(
+            "librosa is required for real audio analysis.\n"
+            "Install with: pip install librosa"
+        )
+
+    y, sr = librosa.load(audio_path, sr=None)
+    duration = librosa.get_duration(y=y, sr=sr)
+
+    # Silence detection: frames below -40 dB RMS threshold
+    frame_length = int(sr * 0.025)
+    hop_length = int(sr * 0.010)
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    db = librosa.amplitude_to_db(rms, ref=np.max)
+    silence_frames = db < -40
+    silence_runs = np.diff(silence_frames.astype(int))
+    silence_count = int((silence_runs == 1).sum())
+    silence_ratio = float(silence_frames.mean())
+
+    # Fundamental frequency (F0) via PYIN
+    f0, voiced_flag, _ = librosa.pyin(
+        y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"),
+        sr=sr, hop_length=hop_length
+    )
+    f0_clean = f0[voiced_flag & ~np.isnan(f0)]
+    f0_var = float(np.std(f0_clean)) if len(f0_clean) > 0 else 0.0
+
+    energy_var = float(np.std(db))
+
+    # Naive speech rate: approximate from non-silence duration
+    voiced_duration = duration * (1 - silence_ratio)
+    speech_rate = (voiced_duration / 60) * 120  # rough estimate ~120 syllables/min → ~90 wpm
+
+    return AcousticFeatures(
+        hesitation_ratio=round(silence_ratio, 4),
+        lexical_diversity=0.0,   # requires transcript; use WhisperTranscriber below
+        speech_rate_wpm=round(speech_rate, 1),
+        f0_variability_hz=round(f0_var, 2),
+        energy_variability_db=round(energy_var, 2),
+        total_duration_s=round(duration, 2),
+        silence_count=silence_count,
+    )
+
+
+def compute_lexical_diversity(transcript: str) -> float:
+    """Type-token ratio from a transcript string."""
+    words = transcript.lower().split()
+    if len(words) < 5:
+        return 0.0
+    return round(len(set(words)) / len(words), 4)
+
+
+def simulate_acoustic_features(
+    stage: str = "normal",
+    seed: int = None,
+) -> AcousticFeatures:
+    """
+    Synthetic feature generation for testing without real audio.
+    stage: 'normal' | 'mild_decline' | 'moderate_decline'
+    """
+    rng = np.random.default_rng(seed)
+
+    profiles = {
+        "normal": dict(
+            hesitation_ratio=(0.08, 0.03),
+            lexical_diversity=(0.72, 0.05),
+            speech_rate_wpm=(110, 10),
+            f0_variability_hz=(25, 5),
+            energy_variability_db=(8, 2),
+            silence_count=(4, 2),
+        ),
+        "mild_decline": dict(
+            hesitation_ratio=(0.18, 0.05),
+            lexical_diversity=(0.58, 0.06),
+            speech_rate_wpm=(90, 12),
+            f0_variability_hz=(18, 5),
+            energy_variability_db=(11, 3),
+            silence_count=(9, 3),
+        ),
+        "moderate_decline": dict(
+            hesitation_ratio=(0.32, 0.07),
+            lexical_diversity=(0.42, 0.07),
+            speech_rate_wpm=(68, 15),
+            f0_variability_hz=(12, 4),
+            energy_variability_db=(15, 4),
+            silence_count=(18, 5),
+        ),
+    }
+    p = profiles[stage]
+
+    def sample(key):
+        mu, sigma = p[key]
+        val = rng.normal(mu, sigma)
+        return max(val, 0)
+
+    return AcousticFeatures(
+        hesitation_ratio=round(min(sample("hesitation_ratio"), 1.0), 4),
+        lexical_diversity=round(min(sample("lexical_diversity"), 1.0), 4),
+        speech_rate_wpm=round(sample("speech_rate_wpm"), 1),
+        f0_variability_hz=round(sample("f0_variability_hz"), 2),
+        energy_variability_db=round(sample("energy_variability_db"), 2),
+        total_duration_s=round(rng.normal(90, 15), 1),
+        silence_count=int(max(0, round(sample("silence_count")))),
+    )
+
+
+class AcousticRiskScorer:
+    """
+    Scores a set of AcousticFeatures against reference norms and returns
+    a 0-100 dementia risk score with per-feature contributions.
+    """
+
+    # Direction: +1 means higher value → higher risk, -1 means lower → higher risk
+    _NORMS = {
+        "hesitation_ratio":      {"mu": 0.08,  "sigma": 0.04,  "direction": +1},
+        "lexical_diversity":     {"mu": 0.72,  "sigma": 0.06,  "direction": -1},
+        "speech_rate_wpm":       {"mu": 110.0, "sigma": 15.0,  "direction": -1},
+        "f0_variability_hz":     {"mu": 25.0,  "sigma": 6.0,   "direction": -1},
+        "energy_variability_db": {"mu": 8.0,   "sigma": 2.5,   "direction": +1},
+    }
+
+    def score(self, features: AcousticFeatures) -> dict:
+        vec = {
+            "hesitation_ratio": features.hesitation_ratio,
+            "lexical_diversity": features.lexical_diversity,
+            "speech_rate_wpm": features.speech_rate_wpm,
+            "f0_variability_hz": features.f0_variability_hz,
+            "energy_variability_db": features.energy_variability_db,
+        }
+        z_scores = {}
+        for feat, val in vec.items():
+            norm = self._NORMS[feat]
+            z = (val - norm["mu"]) / norm["sigma"] * norm["direction"]
+            z_scores[feat] = round(z, 3)
+
+        mean_z = np.mean(list(z_scores.values()))
+        # Sigmoid mapping: z=0 → 50%, z=+2 → ~88%, z=-2 → ~12%
+        risk_score = round(100 / (1 + np.exp(-mean_z)), 1)
+
+        return {
+            "risk_score": risk_score,
+            "risk_level": self._level(risk_score),
+            "z_scores": z_scores,
+            "features": asdict(features),
+        }
+
+    @staticmethod
+    def _level(score: float) -> str:
+        if score < 35:
+            return "Low"
+        if score < 60:
+            return "Moderate"
+        return "High"
+
+
+def simulate_longitudinal_dataset(n_sessions: int = 80, save_path: str = None) -> pd.DataFrame:
+    """Build a longitudinal dataset of acoustic sessions with progressive decline."""
+    rows = []
+    scorer = AcousticRiskScorer()
+    stages = (
+        [("normal", i) for i in range(50)]
+        + [("mild_decline", i) for i in range(20)]
+        + [("moderate_decline", i) for i in range(10)]
+    )
+
+    for idx, (stage, seed_off) in enumerate(stages[:n_sessions]):
+        feat = simulate_acoustic_features(stage=stage, seed=idx + seed_off)
+        result = scorer.score(feat)
+        row = {"session_index": idx, "stage": stage, "risk_score": result["risk_score"]}
+        row.update(asdict(feat))
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        df.to_csv(save_path, index=False)
+        print(f"[Acoustic] Longitudinal dataset saved: {save_path}")
+    return df
+
+
+def plot_acoustic_timeline(df: pd.DataFrame, save_path: str = None):
+    stage_colors = {"normal": "#4CAF50", "mild_decline": "#FF9800", "moderate_decline": "#F44336"}
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 10))
+    features_to_plot = [
+        "risk_score", "hesitation_ratio", "lexical_diversity",
+        "speech_rate_wpm", "f0_variability_hz", "energy_variability_db",
+    ]
+
+    for ax, feat in zip(axes.flatten(), features_to_plot):
+        for stage, group in df.groupby("stage"):
+            ax.scatter(group["session_index"], group[feat],
+                       color=stage_colors[stage], label=stage, s=20, alpha=0.8)
+        ax.set_title(feat.replace("_", " ").title())
+        ax.set_xlabel("Session")
+        ax.legend(fontsize=7)
+        ax.grid(alpha=0.3)
+
+    fig.suptitle("Longitudinal Acoustic Feature Timeline", fontsize=14)
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+        print(f"[Acoustic] Plot saved: {save_path}")
+    plt.show()
+
+
+if __name__ == "__main__":
+    # --- Synthetic demonstration ---
+    scorer = AcousticRiskScorer()
+
+    for stage in ["normal", "mild_decline", "moderate_decline"]:
+        feat = simulate_acoustic_features(stage=stage, seed=7)
+        result = scorer.score(feat)
+        print(f"\n[{stage.upper()}]  Risk: {result['risk_score']}% ({result['risk_level']})")
+        print(json.dumps(result["z_scores"], indent=2))
+
+    df = simulate_longitudinal_dataset(n_sessions=80, save_path="data/acoustic_sessions.csv")
+    plot_acoustic_timeline(df, save_path="outputs/acoustic_timeline.png")

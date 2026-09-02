@@ -1,0 +1,16 @@
+streamlit
+pandas
+numpy
+scikit-learn
+xgboost
+plotly
+matplotlib
+seaborn
+shap
+fpdf2
+joblib
+requests
+librosa
+statsmodels
+nltk
+seaborn
